@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"os/user"
 	"path/filepath"
+	"runtime"
 	"strings"
 )
 
@@ -35,14 +36,85 @@ const QemuExec = "qemu-system-x86_64"
 const QemuImg = "qemu-img"
 
 func main() {
-	config, err := readConfig("test")
-	if err != nil {
-		panic(err)
+	if len(os.Args) < 2 {
+		fmt.Fprintln(os.Stderr, "no command given\n  run <name>\n  list\n  create <name>\n  edit <name>")
+		return
 	}
 
-	err = launchVM(config)
-	if err != nil {
-		panic(err)
+	switch os.Args[1] {
+	case "list":
+		configs, err := listConfigs()
+		if err != nil {
+			panic(err)
+		}
+		for _, config := range configs {
+			fmt.Println(config)
+		}
+
+	case "run":
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "no run name")
+			os.Exit(1)
+		}
+		config, err := readConfig(os.Args[2])
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		if err := launchVM(config); err != nil {
+			panic(err)
+		}
+
+	case "create":
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "no create name")
+			os.Exit(1)
+		}
+
+		config := &VMConfig{
+			Name:   os.Args[2],
+			Memory: "2G",
+			Drives: []Drive{
+				{
+					Type: "img",
+				},
+				{
+					Type: "qcow2",
+				},
+				{
+					Type: "iso",
+				},
+			},
+			Ports: []Port{
+				{
+					Guest: 22,
+					Host:  2222,
+				},
+			},
+		}
+
+		configPath, err := writeConfig(os.Args[2], config)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+
+		fmt.Println(configPath)
+
+		if err := editor(configPath); err != nil {
+			fmt.Fprintln(os.Stderr, "editing config:", err)
+			os.Exit(1)
+		}
+	case "edit":
+		if len(os.Args) < 3 {
+			fmt.Fprintln(os.Stderr, "no edit name")
+			os.Exit(1)
+		}
+
+		configPath := filepath.Join("~", ConfigDir, os.Args[2]+".json")
+		if err := editor(configPath); err != nil {
+			fmt.Fprintln(os.Stderr, "editing config:", err)
+		}
 	}
 }
 
@@ -52,7 +124,7 @@ func listConfigs() ([]string, error) {
 		return nil, fmt.Errorf("getting current user: %w", err)
 	}
 	configFiles, err := os.ReadDir(filepath.Join(usr.HomeDir, ConfigDir))
-	if err != nil {
+	if err != nil && !os.IsNotExist(err) {
 		return nil, fmt.Errorf("reading config file directory: %w", err)
 	}
 	var configs []string
@@ -86,25 +158,31 @@ func readConfig(name string) (*VMConfig, error) {
 	return config, nil
 }
 
-func writeConfig(name string, config *VMConfig) error {
+func writeConfig(name string, config *VMConfig) (string, error) {
 	usr, err := user.Current()
 	if err != nil {
-		return fmt.Errorf("getting current user: %w", err)
+		return "", fmt.Errorf("getting current user: %w", err)
 	}
 
-	filePath := filepath.Join(usr.HomeDir, ConfigDir, name+".json")
+	configDir := filepath.Join(usr.HomeDir, ConfigDir)
+	if err := os.MkdirAll(configDir, os.ModePerm); err != nil {
+		return "", fmt.Errorf("creating config directory: %w", err)
+	}
 
+	filePath := filepath.Join(configDir, name+".json")
 	file, err := os.Create(filePath)
 	if err != nil {
-		return fmt.Errorf("creating config: %w", err)
+		return "", fmt.Errorf("creating config: %w", err)
 	}
 	defer file.Close()
 
-	if err = json.NewEncoder(file).Encode(config); err != nil {
-		return fmt.Errorf("encofing config: %w", err)
+	encoder := json.NewEncoder(file)
+	encoder.SetIndent("", "    ")
+	if err = encoder.Encode(config); err != nil {
+		return "", fmt.Errorf("encofing config: %w", err)
 	}
 
-	return nil
+	return filePath, nil
 }
 
 func launchVM(config *VMConfig) error {
@@ -113,21 +191,33 @@ func launchVM(config *VMConfig) error {
 	args = append(args, "-machine", "q35")
 	args = append(args, "-device", "usb-ehci,id=ehci")
 	for idx, drive := range config.Drives {
+		if drive.Path == "" {
+			continue
+		}
 		switch drive.Type {
 		case "img":
 			// https://qemu-project.gitlab.io/qemu/system/devices/usb.html#ehci-controller-support
 			args = append(args, "-drive", fmt.Sprintf("if=none,id=usb%d,format=raw,file=%s", idx, drive.Path))
 			args = append(args, "-device", fmt.Sprintf("usb-storage,bus=ehci.0,drive=usb%d", idx))
 		case "qcow2":
-			args = append(args, "-drive", fmt.Sprintf("if=virtio,format=qcow2,file=\"%s\"", drive.Path))
+			args = append(args, "-drive", fmt.Sprintf("if=virtio,format=qcow2,file=%s", drive.Path))
+		case "iso":
+			args = append(args, "-cdrom", drive.Path)
 		}
 	}
+	if config.Cores == 0 {
+		config.Cores = uint(runtime.NumCPU())
+	}
 	args = append(args, "-enable-kvm", "-cpu", "host", "-smp", fmt.Sprintf("%d", config.Cores))
+	if config.Fullscreen {
+		args = append(args, "-display", "gtk,full-screen=on")
+	}
 
 	cmd := exec.Command(QemuExec, args...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
+	fmt.Printf("cmd.Args: %v\n", cmd.Args)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("executing qemu: %w", err)
 	}
@@ -150,6 +240,22 @@ func newDisk(name, size string) (string, error) {
 }
 
 func generateConfig() (*VMConfig, error) {
-
 	return nil, nil
+}
+
+func editor(file string) error {
+	editor := os.Getenv("VISUAL")
+	if editor == "" {
+		editor = os.Getenv("EDITOR")
+	}
+
+	cmd := exec.Command(editor, file)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("opening editor: %w", err)
+	}
+
+	return nil
 }
