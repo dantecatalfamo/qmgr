@@ -31,7 +31,7 @@ type VMConfig struct {
 }
 
 const ConfigDir = ".config/qmgr/configs"
-const DiskDir = ".config/qmgr/configs"
+const DiskDir = ".config/qmgr/disks"
 const QemuExec = "qemu-system-x86_64"
 const QemuImg = "qemu-img"
 
@@ -71,6 +71,16 @@ func main() {
 			os.Exit(1)
 		}
 
+		size := "64G"
+		if len(os.Args) > 3 {
+			size = os.Args[3]
+		}
+
+		diskPath, err := newDisk(os.Args[2], size)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+		}
+
 		config := &VMConfig{
 			Name:   os.Args[2],
 			Memory: "2G",
@@ -80,6 +90,7 @@ func main() {
 				},
 				{
 					Type: "qcow2",
+					Path: diskPath,
 				},
 				{
 					Type: "iso",
@@ -189,7 +200,11 @@ func launchVM(config *VMConfig) error {
 	var args []string
 	args = append(args, "-m", config.Memory)
 	args = append(args, "-machine", "q35")
-	args = append(args, "-device", "usb-ehci,id=ehci")
+	args = append(args, "-device", "qemu-xhci,id=xhci")
+	// args = append(args, "-device", "virtio-gpu")
+	args = append(args, "-device", "usb-kbd")
+	args = append(args, "-device", "usb-tablet")
+	args = append(args, "-device", "virtio-net,netdev=net0")
 	for idx, drive := range config.Drives {
 		if drive.Path == "" {
 			continue
@@ -198,7 +213,7 @@ func launchVM(config *VMConfig) error {
 		case "img":
 			// https://qemu-project.gitlab.io/qemu/system/devices/usb.html#ehci-controller-support
 			args = append(args, "-drive", fmt.Sprintf("if=none,id=usb%d,format=raw,file=%s", idx, drive.Path))
-			args = append(args, "-device", fmt.Sprintf("usb-storage,bus=ehci.0,drive=usb%d", idx))
+			args = append(args, "-device", fmt.Sprintf("usb-storage,bus=xhci.0,drive=usb%d", idx))
 		case "qcow2":
 			args = append(args, "-drive", fmt.Sprintf("if=virtio,format=qcow2,file=%s", drive.Path))
 		case "iso":
@@ -211,6 +226,13 @@ func launchVM(config *VMConfig) error {
 	args = append(args, "-enable-kvm", "-cpu", "host", "-smp", fmt.Sprintf("%d", config.Cores))
 	if config.Fullscreen {
 		args = append(args, "-display", "gtk,full-screen=on")
+	}
+	if len(config.Ports) > 0 {
+		fwds := []string{}
+		for _, fwd := range config.Ports {
+			fwds = append(fwds, fmt.Sprintf("tcp::%d-:%d", fwd.Host, fwd.Guest))
+		}
+		args = append(args, "-netdev", fmt.Sprintf("user,id=net0,hostfwd=%s", strings.Join(fwds, ",")))
 	}
 
 	cmd := exec.Command(QemuExec, args...)
